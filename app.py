@@ -93,6 +93,7 @@ MOODS={
  'talk':('🥰','이야기하고 싶어요','#F8DFE7'),
 }
 st.markdown('''<style>
+[data-stale="true"], [data-testid="stElementContainer"][data-stale="true"] { opacity: 1 !important; filter: none !important; }
 .stApp{background:#FCF8F0;color:#35372F}.block-container{max-width:620px;padding:1.4rem 1rem 3rem}
 header[data-testid="stHeader"],#MainMenu,footer{display:none!important}
 h1{font-size:1.65rem!important}h2,h3{font-size:1.15rem!important}
@@ -198,9 +199,9 @@ def join_room(name,code):
     with db() as c:
         room=c.execute('SELECT id FROM ms_rooms WHERE code_hash=%s FOR UPDATE',(hashed,)).fetchone()
         if not room: raise ValueError('일치하는 방이 없어요. 코드를 다시 확인해 주세요.')
-        # Names alone cannot establish ownership. Never attach a new visitor to an existing identity.
-        duplicate=c.execute('SELECT id FROM ms_people WHERE room_id=%s AND name=%s',(room['id'],name.strip())).fetchone()
-        if duplicate: raise ValueError('이미 같은 이름이 있어요. 구분되는 이름을 입력해 주세요. 예: 민수2')
+        existing=c.execute('SELECT id FROM ms_people WHERE room_id=%s AND name=%s',(room['id'],name.strip())).fetchone()
+        if existing:
+            return room['id'],existing['id']
         total=c.execute('SELECT count(*) AS n FROM ms_people WHERE room_id=%s',(room['id'],)).fetchone()['n']
         if total>=30: raise ValueError('이 방은 참가 인원 30명이 가득 찼어요.')
         pid=uuid.uuid4().hex
@@ -364,11 +365,29 @@ def room_screen():
     if sent:
         if not st.session_state.mood:st.warning('이모티콘을 먼저 하나 골라 주세요.')
         else:
-            save_mood(st.session_state.mood,reason,relief)
+            loading=st.empty()
+            selected_emoji=catalog.get(st.session_state.mood, ('🙂', '', ''))[0]
+            try:
+                with loading.container():
+                    components.html(f"""<!doctype html><html lang="ko"><meta charset="utf-8">
+                    <div style="text-align:center;background:#fff4dc;color:#382c20;border-radius:16px;padding:12px;font:16px system-ui">
+                      <div style="font-size:34px">{esc(selected_emoji)}</div>
+                      <strong role="status">로딩 중… 마음을 저장하고 있어요</strong>
+                      <div id="elapsed">경과 시간 0초</div>
+                    </div><script>
+                    const start = performance.now();
+                    setInterval(() => {{
+                      const seconds = Math.floor((performance.now() - start) / 1000);
+                      document.getElementById('elapsed').textContent = `경과 시간 ${{seconds}}초`;
+                    }}, 200);
+                    </script></html>""", height=124)
+                save_mood(st.session_state.mood,reason,relief)
+            finally:
+                loading.empty()
             st.session_state.notice='마음을 전했어요 🌿';st.rerun()
     if st.session_state.pop('notice',None):st.success('마음을 전했어요 🌿')
     family_panel()
-    st.caption('이름만으로는 본인 확인이 안 돼요. 이 간단 버전은 접속이 유지되는 동안 내 마음을 수정할 수 있어요. 나가거나 연결이 끊긴 뒤 재입장할 때는 새 이름이 필요할 수 있어요. 기존 기록은 방에 남습니다.')
+    st.caption('같은 방 코드와 이름으로 재입장하면 기존 기록을 이어서 사용할 수 있어요. 방 코드는 가족에게만 알려 주세요.')
 
 def run():
     browser_sync()

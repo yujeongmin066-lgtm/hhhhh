@@ -303,3 +303,4 @@ except PermissionError:leave();st.rerun()
 except psycopg.Error:
     st.error('저장소에 연결하지 못했어요. 잠시 후 다시 시도해 주세요. 관리자는 Streamlit Secrets의 Neon 연결 주소와 테이블 생성 권한을 확인해 주세요.')
     if st.button('다시 시도',use_container_width=True):st.rerun()
+

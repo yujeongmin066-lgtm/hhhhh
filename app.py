@@ -7,7 +7,10 @@ import base64
 import hashlib
 import html
 import re
-import time
+import secrets
+import tempfile
+from pathlib import Path
+import streamlit.components.v1 as components
 import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -17,6 +20,69 @@ from psycopg.rows import dict_row
 import streamlit as st
 
 st.set_page_config(page_title="마음모지",page_icon="😊",layout="centered",initial_sidebar_state="collapsed")
+# Browser storage lives at the app's origin; the database stores only a token hash.
+@st.cache_resource
+def browser_component():
+    folder = tempfile.TemporaryDirectory(prefix='maummoji_')
+    Path(folder.name, 'index.html').write_text('''<!doctype html><meta charset="utf-8"><script>
+const post = (type, data={}) => parent.postMessage({isStreamlitMessage:true,type,...data}, '*');
+const key = 'maummoji.membership.v1';
+let last;
+addEventListener('message', ({data,source}) => {
+  if (source !== parent || data?.type !== 'streamlit:render') return;
+  const {op,id,value} = data.args;
+  if (last === id) return;
+  last = id;
+  try {
+    if (op === 'write') localStorage.setItem(key, JSON.stringify(value));
+    if (op === 'clear') localStorage.removeItem(key);
+    const raw = localStorage.getItem(key);
+    let saved = null;
+    try { saved = JSON.parse(raw); } catch (_) {}
+    post('streamlit:setComponentValue', {value:{id,saved},dataType:'json'});
+  } catch (_) {
+    post('streamlit:setComponentValue', {value:{id,error:true},dataType:'json'});
+  }
+});
+post('streamlit:componentReady',{apiVersion:1});
+post('streamlit:setFrameHeight',{height:0});
+</script>''', encoding='utf-8')
+    return folder, components.declare_component('maummoji_browser', path=folder.name)
+
+
+def browser_sync():
+    ss = st.session_state
+    if 'browser_cmd' not in ss:
+        ss.browser_cmd = dict(op='read', id=uuid.uuid4().hex, value=None)
+    cmd = ss.browser_cmd
+    _, component = browser_component()
+    result = component(**cmd, key='maummoji_browser_storage', default=None)
+    if ss.get('browser_done') == cmd['id']:
+        return
+    if not isinstance(result, dict) or result.get('id') != cmd['id']:
+        st.stop()
+    if result.get('error'):
+        st.warning('브라우저 저장을 사용할 수 없어요. 일반 창에서 사이트 저장을 허용한 뒤 다시 접속하면 입장 기록을 유지할 수 있어요.')
+    saved = result.get('saved')
+    if cmd['op'] == 'read' and isinstance(saved, dict):
+        token, code = saved.get('token'), saved.get('code')
+        if (isinstance(token, str) and re.fullmatch(r'[A-Za-z0-9_-]{43}', token)
+            and isinstance(code, str) and re.fullmatch(r'[A-Z0-9]{6,24}', code)):
+            with db() as c:
+                row = c.execute('''SELECT p.id,p.room_id FROM ms_browser_sessions s
+                    JOIN ms_people p ON p.id=s.person_id
+                    JOIN ms_rooms r ON r.id=p.room_id
+                    WHERE s.token_hash=%s AND r.code_hash=%s''',
+                    (token_hash(token),code_hash(code))).fetchone()
+            if row:
+                ss.update(started=True,room=row['room_id'],person=row['id'],invite=code,login_token=token)
+    ss.browser_done = cmd['id']
+
+
+def token_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
 KST=ZoneInfo('Asia/Seoul')
 MOODS={
  'happy':('😊','행복해요','#FFF0B8'),
@@ -81,6 +147,10 @@ def init_database(fingerprint):
         c.execute('''CREATE TABLE IF NOT EXISTS ms_limits(
             scope TEXT PRIMARY KEY, since TIMESTAMPTZ NOT NULL DEFAULT now(), n INTEGER NOT NULL DEFAULT 0)''')
 
+        c.execute('''CREATE TABLE IF NOT EXISTS ms_browser_sessions(
+            token_hash TEXT PRIMARY KEY,
+            person_id TEXT NOT NULL REFERENCES ms_people(id) ON DELETE CASCADE)''')
+
 def db():
     try: url=str(st.secrets.get('DATABASE_URL',''))
     except Exception: url=''
@@ -97,9 +167,15 @@ def allowed(scope,limit):
         c.execute('UPDATE ms_limits SET n=n+1 WHERE scope=%s',(scope,));return True
 
 def enter(room,person,code):
+    token = secrets.token_urlsafe(32)
+    invite = code.strip().upper()
+    with db() as c:
+        c.execute('INSERT INTO ms_browser_sessions(token_hash,person_id) VALUES (%s,%s)',(token_hash(token),person))
     st.session_state.clear()
-    st.session_state.update(started=True,room=room,person=person,invite=code.strip().upper(),until=time.time()+12*3600)
+    st.session_state.update(started=True,room=room,person=person,invite=invite,login_token=token,
+        browser_cmd=dict(op='write',id=uuid.uuid4().hex,value=dict(token=token,code=invite)))
     st.rerun()
+
 
 def create_room(title,name,code):
     valid_name(name);valid_code(code)
@@ -133,10 +209,14 @@ def join_room(name,code):
 
 def me():
     ss=st.session_state
-    if time.time()>=ss.get('until',0): raise PermissionError()
+    token = ss.get('login_token')
+    if not token: raise PermissionError()
     with db() as c:
         person=c.execute('''SELECT p.id,p.room_id,p.name,r.title FROM ms_people p
-            JOIN ms_rooms r ON r.id=p.room_id WHERE p.id=%s AND p.room_id=%s''',(ss.get('person'),ss.get('room'))).fetchone()
+            JOIN ms_rooms r ON r.id=p.room_id
+            JOIN ms_browser_sessions s ON s.person_id=p.id
+            WHERE p.id=%s AND p.room_id=%s AND s.token_hash=%s''',
+            (ss.get('person'),ss.get('room'),token_hash(token))).fetchone()
     if not person: raise PermissionError()
     return person
 
@@ -190,7 +270,12 @@ def save_mood(mood,reason,relief):
           relief=EXCLUDED.relief,updated_at=clock_timestamp()''',(person['id'],person['room_id'],mood if mood in MOODS else 'happy',reason.strip(),relief.strip(),None if mood in MOODS else mood))
 
 def leave():
-    st.session_state.clear();st.session_state.started=True
+    token = st.session_state.get('login_token')
+    if token:
+        with db() as c:
+            c.execute('DELETE FROM ms_browser_sessions WHERE token_hash=%s',(token_hash(token),))
+    st.session_state.clear()
+    st.session_state.update(started=True,browser_cmd=dict(op='clear',id=uuid.uuid4().hex,value=None))
 
 def start():st.session_state.started=True
 
@@ -286,16 +371,15 @@ def room_screen():
     st.caption('이름만으로는 본인 확인이 안 돼요. 이 간단 버전은 접속이 유지되는 동안 내 마음을 수정할 수 있어요. 나가거나 연결이 끊긴 뒤 재입장할 때는 새 이름이 필요할 수 있어요. 기존 기록은 방에 남습니다.')
 
 def run():
+    browser_sync()
     if not st.session_state.get('started'):
         image=base64.b64encode(SVG.encode()).decode()
         st.markdown(f'<div style="height:12vh"></div><div style="text-align:center"><img alt="하트가 달린 웃는 말풍선 로고" src="data:image/svg+xml;base64,{image}" width="230"></div>',unsafe_allow_html=True)
         _,center,_=st.columns([1,2,1])
         center.button('시작',type='primary',on_click=start,use_container_width=True)
         return
-    if st.session_state.get('person') and time.time()<st.session_state.get('until',0):room_screen()
-    else:
-        if st.session_state.get('person'):leave()
-        lobby()
+    if st.session_state.get('person'):room_screen()
+    else:lobby()
 
 try:run()
 except ValueError as error:st.warning(str(error))
@@ -303,4 +387,3 @@ except PermissionError:leave();st.rerun()
 except psycopg.Error:
     st.error('저장소에 연결하지 못했어요. 잠시 후 다시 시도해 주세요. 관리자는 Streamlit Secrets의 Neon 연결 주소와 테이블 생성 권한을 확인해 주세요.')
     if st.button('다시 시도',use_container_width=True):st.rerun()
-
